@@ -1,0 +1,29 @@
+{
+  "name": "capella-model-service-cache-demo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Token, latency and resource savings from Standard and Semantic Cache in Capella Model Service (AI Gateway)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22.9"
+  },
+  "scripts": {
+    "mock": "npm run start -w @demo/mock-gateway",
+    "bench": "npm run bench -w @demo/bench --",
+    "dev": "npm run dev -w @demo/web",
+    "build": "npm run build -w @demo/web",
+    "typecheck": "tsc -p packages/core && tsc -p packages/mock-gateway && tsc -p apps/bench && npm run typecheck -w @demo/web",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}

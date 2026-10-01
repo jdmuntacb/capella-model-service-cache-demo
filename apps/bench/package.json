@@ -1,0 +1,12 @@
+{
+  "name": "@demo/bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "tsx --env-file-if-exists=../../.env src/main.ts"
+  },
+  "dependencies": {
+    "@demo/core": "*"
+  }
+}
