@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHash, randomUUID } from "node:crypto";
 import { HEADERS } from "@demo/core";
 import { GatewayCache, type CacheContext, type ChatRequestBody } from "./cache";
+import { denseEmbed, tokenize } from "./embed";
 import { complete, DEFAULT_LATENCY, type LatencyProfile } from "./llm";
 
 export interface MockOptions {
@@ -34,6 +35,9 @@ export interface MockStats {
   cachedCompletionTokens: number;
   cacheEntries: number;
 }
+
+/** The mock's embedding model, served on /v1/embeddings and listed in /v1/models. */
+export const MOCK_EMBEDDING_MODEL = "mock-lexical-embedding";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
@@ -119,6 +123,7 @@ export function createMockGateway(opts: MockOptions = {}): { server: Server; sta
       res.setHeader(HEADERS.cacheEnabled, String(mode !== "none"));
       res.setHeader("X-cb-cache-expiry", `${ttl}s`);
       res.setHeader("X-cb-semantic-cache-match-threshold", String(mode === "standard" ? 1 : threshold));
+      res.setHeader("X-cb-semantic-cache-embedding-model", mode === "semantic" ? "mock-lexical-embedding" : "");
     }
 
     if (mode !== "none") {
@@ -160,6 +165,31 @@ export function createMockGateway(opts: MockOptions = {}): { server: Server; sta
     return json(res, 200, payload);
   }
 
+  // Like the real gateway, embeddings are never cached: every call goes to the (simulated) model.
+  async function embeddings(req: IncomingMessage, res: ServerResponse) {
+    if (!(req.headers.authorization ?? "").startsWith("Bearer ")) return json(res, 401, { error: { message: "missing bearer token" } });
+    let body: { model?: string; input?: string | string[] };
+    try {
+      body = JSON.parse(await readBody(req));
+    } catch {
+      return json(res, 400, { error: { message: "invalid JSON body" } });
+    }
+    if (body.model !== MOCK_EMBEDDING_MODEL) return json(res, 404, { error: { message: `model ${body.model} not found` } });
+    const inputs = (Array.isArray(body.input) ? body.input : [body.input]).filter((x): x is string => typeof x === "string" && x.length > 0);
+    if (!inputs.length) return json(res, 400, { error: { message: "input is required" } });
+    counters.requests++;
+    counters.upstreamCalls++;
+    await sleep(40 + Math.random() * 40);
+    const tokens = inputs.reduce((a, t) => a + Math.max(1, Math.ceil(t.split(/\s+/).length * 1.3)), 0);
+    counters.promptTokens += tokens;
+    return json(res, 200, {
+      object: "list",
+      model: MOCK_EMBEDDING_MODEL,
+      data: inputs.map((t, index) => ({ object: "embedding", index, embedding: denseEmbed(tokenize(t)) })),
+      usage: { prompt_tokens: tokens, completion_tokens: 0, total_tokens: tokens },
+    });
+  }
+
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const route = `${req.method} ${url.pathname}`;
@@ -168,8 +198,24 @@ export function createMockGateway(opts: MockOptions = {}): { server: Server; sta
     switch (route) {
       case "POST /v1/chat/completions":
         return done(chatCompletions(req, res));
+      case "POST /v1/embeddings":
+        return done(embeddings(req, res));
+      case "GET /v1/info":
+      case "GET /info":
+        // Same shape as the gateway's /v1/info; durations are Go nanoseconds.
+        return json(res, 200, {
+          version: "mock",
+          commit_hash: "",
+          build_time: "",
+          max_requests_per_minute: 0,
+          defaults: { default_cache_expiry_duration: expirySeconds * 1e9, max_tokens: 512, temperature: 0.8 },
+          models: [
+            ...models.map((id) => ({ id, model_name: id, server_kind: "mock", status: "healthy", server_reachable: true, info: null })),
+            { id: MOCK_EMBEDDING_MODEL, model_name: MOCK_EMBEDDING_MODEL, server_kind: "mock", status: "healthy", server_reachable: true, info: null },
+          ],
+        });
       case "GET /v1/models":
-        return json(res, 200, { object: "list", data: models.map((id) => ({ id, object: "model", owned_by: "mock" })) });
+        return json(res, 200, { object: "list", data: [...models, MOCK_EMBEDDING_MODEL].map((id) => ({ id, object: "model", owned_by: "mock" })) });
       case "GET /health":
         return json(res, 200, { status: "ok", mock: true });
       case "GET /mock/stats":

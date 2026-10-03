@@ -1,6 +1,15 @@
 import type { CacheMode } from "@demo/core";
 import type { BenchResult, ModeRun } from "./run";
 
+/** One line on the gateway build and models, from GET /v1/info. */
+function gatewayLine(b: BenchResult): string | undefined {
+  const g = b.target.gateway;
+  if (!g) return undefined;
+  const models = g.models.map((m) => `${m.name} (${m.status ?? "unknown"}${m.reachable === false ? ", unreachable" : ""})`).join(", ");
+  const ttl = g.defaults.cacheExpirySeconds !== undefined ? ` · default cache TTL ${g.defaults.cacheExpirySeconds}s` : "";
+  return `Gateway ${g.version}${g.commitHash ? ` (commit ${g.commitHash}${g.buildTime ? `, built ${g.buildTime}` : ""})` : ""}${ttl} · models: ${models || "none listed"}`;
+}
+
 const LABEL: Record<CacheMode, string> = { none: "No cache", standard: "Standard cache", semantic: "Semantic cache" };
 const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
 const ms = (x: number) => (x >= 1000 ? `${(x / 1000).toFixed(2)} s` : `${Math.round(x)} ms`);
@@ -21,6 +30,8 @@ export function toMarkdown(b: BenchResult): string {
     `Target: **${b.target.mock ? "mock gateway (simulated Bedrock)" : "Capella Model Service"}** · model \`${b.target.model}\` · ` +
       `${b.options.requests} helpdesk questions per mode (seed ${b.options.seed}, concurrency ${b.options.concurrency})`,
   );
+  const gw = gatewayLine(b);
+  if (gw) lines.push(gw);
   lines.push(`Pricing: $${b.pricing.inputPerMTok}/M input, $${b.pricing.outputPerMTok}/M output (${b.pricing.source})`);
   lines.push("");
   lines.push("## Savings vs no cache");
@@ -113,6 +124,7 @@ th{color:var(--muted);font-weight:600}.note{color:var(--muted);font-size:13px}
 <h1>Capella Model Service cache benchmark</h1>
 <p class="sub">${esc(b.target.mock ? "Mock gateway (simulated Bedrock)" : "Capella Model Service")} · ${esc(b.target.model)} ·
 ${b.options.requests} helpdesk questions per mode · ${esc(b.startedAt)}</p>
+${gatewayLine(b) ? `<p class="sub">${esc(gatewayLine(b)!)}</p>` : ""}
 ${best ? `<p class="sub">Headline numbers are for <b>${LABEL[best[0]]}</b> vs no cache.</p>` : ""}
 <section class="tiles">${tiles.map(([t, v, s]) => `<div class="tile">${esc(t)}<b>${esc(v)}</b><span>${esc(s)}</span></div>`).join("")}</section>
 <h2>Token saving · Less latency · Resource saving</h2>

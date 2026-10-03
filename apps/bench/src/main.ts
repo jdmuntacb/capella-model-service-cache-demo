@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { CACHE_MODES, clientFromEnv, isMock, pricingFromEnv, type CacheMode } from "@demo/core";
+import { CACHE_MODES, clientFromEnv, getInfo, isMock, pricingFromEnv, type CacheMode } from "@demo/core";
 import { runBench } from "./run";
 import { toHtml, toMarkdown } from "./report";
 
@@ -44,10 +44,18 @@ if (mock) {
   }
 }
 
-console.log(`Benchmarking ${mock ? "mock gateway" : endpoint} · model ${client.model}`);
+// Record which gateway build and models produced these numbers.
+const gateway = await getInfo(endpoint, mock ? "mock-key" : process.env.CMS_API_KEY!, AbortSignal.timeout(15_000)).catch((err) => {
+  console.warn(`Could not read ${endpoint}/v1/info: ${err instanceof Error ? err.message : err}`);
+  return null;
+});
+console.log(
+  `Benchmarking ${mock ? "mock gateway" : endpoint} · model ${client.model}` +
+    (gateway ? ` · gateway ${gateway.version}${gateway.commitHash ? ` (${gateway.commitHash})` : ""}` : ""),
+);
 const result = await runBench(
   client,
-  { endpoint: mock ? "mock" : new URL(endpoint).host, model: client.model, mock },
+  { endpoint: mock ? "mock" : new URL(endpoint).host, model: client.model, mock, gateway },
   pricing,
   {
     requests: Number(values.requests),

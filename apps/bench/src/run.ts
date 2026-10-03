@@ -6,6 +6,7 @@ import {
   summarize,
   type CacheMode,
   type GatewayClient,
+  type GatewayInfo,
   type ModeSummary,
   type Pricing,
   type QuestionKind,
@@ -44,7 +45,8 @@ export interface ModeRun {
 export interface BenchResult {
   runId: string;
   startedAt: string;
-  target: { endpoint: string; model: string; mock: boolean };
+  /** gateway: GET /v1/info at run time (null if unavailable). */
+  target: { endpoint: string; model: string; mock: boolean; gateway?: GatewayInfo | null };
   pricing: Pricing;
   options: Omit<BenchOptions, "onProgress">;
   workload: WorkloadItem[];
