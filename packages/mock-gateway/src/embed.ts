@@ -90,3 +90,24 @@ export function similarity(a: Vector, b: Vector): number {
   for (const [k, x] of small) s += x * (big.get(k) ?? 0);
   return s;
 }
+
+export const DENSE_DIMENSIONS = 256;
+
+/** A dense, L2-normalized vector for /v1/embeddings: the sum of one fixed pseudo-random direction per concept. */
+export function denseEmbed(tokens: string[]): number[] {
+  const v = new Array<number>(DENSE_DIMENSIONS).fill(0);
+  for (const tok of tokens) {
+    let h = 2166136261;
+    for (let i = 0; i < tok.length; i++) h = Math.imul(h ^ tok.charCodeAt(i), 16777619);
+    // xorshift32 seeded by the concept, so the same concept always gets the same direction
+    let x = h >>> 0 || 1;
+    for (let d = 0; d < DENSE_DIMENSIONS; d++) {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      v[d] += ((x >>> 0) / 4294967296) * 2 - 1;
+    }
+  }
+  const norm = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
+  return v.map((x) => Number((x / norm).toFixed(6)));
+}

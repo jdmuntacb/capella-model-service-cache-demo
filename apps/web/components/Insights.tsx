@@ -1,16 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { HEADERS, costUSD, type CacheMode, type Pricing } from "@demo/core";
+import { HEADERS, costUSD, isEmbeddingModel, type CacheMode, type GatewayInfo, type ModelInfo, type Pricing, type Trace } from "@demo/core";
+import { GatewayInfoView, connectionLabel, connectionPayload, type Connection } from "./ConnectionDialog";
 import type { Settings } from "./HelpdeskApp";
+import TraceView from "./TraceView";
 import { hitLabel } from "./format";
-import { CouchbaseMark, IconClose, IconPlay } from "./icons";
+import { CouchbaseMark, IconClose, IconExpand, IconPlay, IconSettings, IconShrink } from "./icons";
 
 export interface PublicConfig {
   mock: boolean;
   model: string;
   endpointHost: string;
   pricing: Pricing;
+  customConnectionAllowed: boolean;
 }
 
 export interface LedgerEntry {
@@ -25,6 +28,16 @@ export interface LedgerEntry {
   latencyMs: number;
   promptTokens: number;
   completionTokens: number;
+  scoped: boolean;
+  trace?: Trace;
+  error?: string;
+  /** First message of a conversation, so the request is identical to any earlier ask of the same question. */
+  firstTurn: boolean;
+  repeatMiss?: boolean;
+  /** "embedding" = POST /v1/embeddings, which the gateway never caches. */
+  kind?: "chat" | "embedding";
+  model?: string;
+  dimensions?: number;
 }
 
 interface ModeRunSummary {
@@ -42,7 +55,7 @@ interface ModeRunSummary {
 interface Benchmark {
   startedAt: string;
   dir: string;
-  target: { mock: boolean; model: string };
+  target: { mock: boolean; model: string; gateway?: GatewayInfo | null };
   options: { requests: number };
   runs: ModeRunSummary[];
 }
@@ -87,9 +100,48 @@ export default function Insights(props: {
   onSimulate: (n: number) => void;
   onStopSim: () => void;
   onClose: () => void;
+  connection: Connection;
+  model: string;
+  onModel: (model: string) => void;
+  onOpenConnection: () => void;
 }) {
-  const { config, settings, onSettings, ledger, sim } = props;
-  const [tab, setTab] = useState<"live" | "bench">("live");
+  const { config, settings, onSettings, sim } = props;
+  // Failed requests and embeddings show in Traces but not in the cache savings figures.
+  const ledger = props.ledger.filter((e) => !e.error && e.kind !== "embedding");
+  const embedModel = isEmbeddingModel(props.model);
+  const [full, setFull] = useState(false);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [tab, setTab] = useState<"live" | "traces" | "bench">("live");
+  const [openTrace, setOpenTrace] = useState<string | null>(null);
+  const conn = connectionLabel(props.connection, config);
+  const [info, setInfo] = useState<GatewayInfo | null | undefined>(undefined);
+  const [infoOpen, setInfoOpen] = useState(false);
+  // Only the endpoint and key decide which models exist; picking a model must not refetch.
+  const modelsKey = JSON.stringify({ ...connectionPayload(props.connection), model: undefined });
+
+  useEffect(() => {
+    let cancelled = false;
+    setInfo(undefined);
+    // /api/models lists the models and reads /v1/info in one call.
+    fetch("/api/models", { method: "POST", headers: { "Content-Type": "application/json" }, body: modelsKey })
+      .then((r) => r.json())
+      .then((j) => {
+        if (cancelled) return;
+        setInfo(j.info ?? null);
+        setModels(Array.isArray(j.models) ? j.models : []);
+      })
+      .catch(() => !cancelled && setInfo(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [modelsKey]);
+
+  useEffect(() => {
+    if (!full) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setFull(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [full]);
   const [bench, setBench] = useState<Benchmark | null | undefined>(undefined);
 
   useEffect(() => {
@@ -112,14 +164,22 @@ export default function Insights(props: {
   const recent = ledger.slice(-40);
   const maxLat = Math.max(1, ...recent.map((e) => e.latencyMs));
 
-  const nextHeaders = [
+  const chatModels = models.filter((m) => !isEmbeddingModel(m.name));
+  const embedModels = models.filter((m) => isEmbeddingModel(m.name));
+  const custom = props.connection.source === "custom";
+  const selected = props.connection.model;
+  const listed = models.some((m) => m.name === selected);
+
+  const nextHeaders = embedModel
+    ? ["POST /v1/embeddings", "No X-cb-cache header: embeddings", "are not cached by the gateway."]
+    : [
     `${HEADERS.cacheType}: ${settings.mode}`,
     ...(settings.scoped ? [`${HEADERS.attributePrefix}topic: <conversation id>`] : []),
     ...(settings.mode === "semantic" && settings.threshold !== undefined ? [`${HEADERS.cacheThreshold}: ${settings.threshold.toFixed(2)}`] : []),
-  ];
+      ];
 
   return (
-    <aside className="insights" aria-label="Gateway insights">
+    <aside className={`insights ${full ? "full" : ""}`} aria-label="Gateway insights">
       <header className="ins-head">
         <span className="ins-mark">
           <CouchbaseMark size={22} />
@@ -128,30 +188,122 @@ export default function Insights(props: {
           <div className="ins-title">Gateway insights</div>
           <div className="ins-sub">Capella Model Service</div>
         </div>
+        <button
+          className="icon-btn"
+          onClick={() => setFull((f) => !f)}
+          aria-pressed={full}
+          aria-label={full ? "Exit full screen" : "Expand to full screen"}
+          title={full ? "Exit full screen (Esc)" : "Expand to full screen"}
+        >
+          {full ? <IconShrink /> : <IconExpand />}
+        </button>
         <button className="icon-btn" onClick={props.onClose} aria-label="Close insights">
           <IconClose />
         </button>
       </header>
 
-      <div className="ins-conn">
-        <span className={`conn-dot ${config ? (config.mock ? "conn-mock" : "conn-live") : ""}`} />
-        {config ? (config.mock ? "Mock gateway (simulated Bedrock)" : config.endpointHost) : "Connecting..."}
-        {config && <code>{config.model}</code>}
-      </div>
+      <button className="ins-conn" onClick={props.onOpenConnection} title="Connection settings: endpoint, API key and model">
+        <span className={`conn-dot ${config || props.connection.source !== "server" ? (conn.mock ? "conn-mock" : "conn-live") : ""}`} />
+        <span className="conn-host">{conn.host}</span>
+        <code>{props.model}</code>
+        <IconSettings />
+      </button>
+      {info && (
+        <div className="ins-gw">
+          <button className="link" onClick={() => setInfoOpen((o) => !o)} aria-expanded={infoOpen}>
+            Gateway {info.version}
+            {info.commitHash ? ` · ${info.commitHash}` : ""} · {info.models.filter((m) => m.status === "healthy" && m.reachable !== false).length}/{info.models.length} models healthy
+          </button>
+          {infoOpen && <GatewayInfoView info={info} />}
+        </div>
+      )}
 
       <div className="tabs" role="tablist">
         <button role="tab" aria-selected={tab === "live"} className={tab === "live" ? "on" : ""} onClick={() => setTab("live")}>
           Live session
+        </button>
+        <button role="tab" aria-selected={tab === "traces"} className={tab === "traces" ? "on" : ""} onClick={() => setTab("traces")}>
+          Traces{props.ledger.length ? ` (${props.ledger.length})` : ""}
         </button>
         <button role="tab" aria-selected={tab === "bench"} className={tab === "bench" ? "on" : ""} onClick={() => setTab("bench")}>
           Benchmark
         </button>
       </div>
 
-      {tab === "live" ? (
+      {tab === "traces" ? (
         <div className="ins-body">
+          <p className="ins-help">Every request this session, newest first, including office traffic. Open one to see why it was a hit or a miss and the exact request and response.</p>
+          {props.ledger.length === 0 && <p className="empty-note">No requests yet.</p>}
+          <ul className="trace-list">
+            {props.ledger
+              .slice()
+              .reverse()
+              .map((e) => (
+                <li key={e.id} className={openTrace === e.id ? "open" : ""}>
+                  <button className="trace-item" onClick={() => setOpenTrace(openTrace === e.id ? null : e.id)} aria-expanded={openTrace === e.id}>
+                    <span className={`feed-dot ${e.error ? "err" : e.cacheHit ? "hit" : "miss"}`} />
+                    <span className="trace-item-q">{e.question}</span>
+                    <span className="trace-item-meta">
+                      {e.error ? "failed" : e.kind === "embedding" ? `embedding · ${e.dimensions ?? "?"} dims` : e.cacheHit ? "hit" : e.mode === "none" ? "no cache" : e.repeatMiss ? "repeat miss" : "miss"} · {fmtMs(e.latencyMs)}
+                    </span>
+                  </button>
+                  {openTrace === e.id && (
+                    <TraceView
+                      mode={e.mode}
+                      cacheHit={e.cacheHit}
+                      matchScore={e.matchScore}
+                      promptTokens={e.promptTokens}
+                      completionTokens={e.completionTokens}
+                      latencyMs={e.latencyMs}
+                      scoped={e.scoped}
+                      trace={e.trace}
+                      error={e.error}
+                      repeatMiss={e.repeatMiss}
+                      embedding={e.kind === "embedding" ? { model: e.model ?? props.model, dimensions: e.dimensions ?? 0 } : undefined}
+                    />
+                  )}
+                </li>
+              ))}
+          </ul>
+        </div>
+      ) : tab === "live" ? (
+        <div className="ins-body ins-grid">
           <section>
+            <label className="ins-label" htmlFor="ins-model">
+              Model
+            </label>
+            <select id="ins-model" className="ins-select" value={selected} onChange={(e) => props.onModel(e.target.value)}>
+              {!custom && <option value="">Server default ({config?.model ?? "CMS_MODEL"})</option>}
+              {selected && !listed && <option value={selected}>{selected}</option>}
+              {chatModels.length > 0 && (
+                <optgroup label="Chat: /v1/chat/completions">
+                  {chatModels.map((m) => (
+                    <option key={m.id} value={m.name}>
+                      {m.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {embedModels.length > 0 && (
+                <optgroup label="Embedding: /v1/embeddings">
+                  {embedModels.map((m) => (
+                    <option key={m.id} value={m.name}>
+                      {m.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
+            <p className="ins-help">
+              {embedModel
+                ? "Embedding model: each message is sent to /v1/embeddings and the reply shows the vector and its similarity to earlier questions. The gateway does not cache embeddings."
+                : "Chat model: messages go to /v1/chat/completions through the cache. Pick an embedding model to see the vectors the semantic cache compares."}
+            </p>
+          </section>
+
+          <section className={embedModel ? "is-disabled" : ""}>
             <div className="ins-label">Cache mode</div>
+            {embedModel && <p className="ins-help">Not used for embeddings. Pick a chat model to use the cache.</p>}
             <div className="segmented" role="radiogroup" aria-label="Cache mode">
               {MODES.map((m) => (
                 <button
@@ -159,6 +311,7 @@ export default function Insights(props: {
                   role="radio"
                   aria-checked={settings.mode === m.id}
                   className={settings.mode === m.id ? `on on-${m.id}` : ""}
+                  disabled={embedModel}
                   onClick={() => onSettings({ ...settings, mode: m.id })}
                 >
                   {m.label}
@@ -167,7 +320,7 @@ export default function Insights(props: {
             </div>
             <p className="ins-help">{MODES.find((m) => m.id === settings.mode)?.help}</p>
             <label className="toggle">
-              <input type="checkbox" checked={settings.scoped} onChange={(e) => onSettings({ ...settings, scoped: e.target.checked })} />
+              <input type="checkbox" checked={settings.scoped} disabled={embedModel} onChange={(e) => onSettings({ ...settings, scoped: e.target.checked })} />
               <span>
                 Scope to each conversation
                 <small>Sends {HEADERS.attributePrefix}topic so answers are reused only within the same conversation. Safer for follow-up questions, but fewer hits.</small>
@@ -179,6 +332,7 @@ export default function Insights(props: {
                   <input
                     type="checkbox"
                     checked={settings.threshold !== undefined}
+                    disabled={embedModel}
                     onChange={(e) => onSettings({ ...settings, threshold: e.target.checked ? 0.75 : undefined })}
                   />
                   <span>
@@ -208,7 +362,7 @@ export default function Insights(props: {
           <section>
             <div className="ins-label-row">
               <span className="ins-label">This session</span>
-              {ledger.length > 0 && (
+              {props.ledger.length > 0 && (
                 <button className="link" onClick={props.onClear}>
                   Reset
                 </button>
@@ -269,7 +423,7 @@ export default function Insights(props: {
                 </button>
               </div>
             ) : (
-              <button className="btn btn-dark btn-sm" onClick={() => props.onSimulate(20)}>
+              <button className="btn btn-dark btn-sm" onClick={() => props.onSimulate(20)} disabled={embedModel} title={embedModel ? "Pick a chat model to simulate office traffic" : undefined}>
                 <IconPlay /> Simulate 20 colleagues
               </button>
             )}
@@ -293,7 +447,7 @@ export default function Insights(props: {
           </section>
         </div>
       ) : (
-        <div className="ins-body">
+        <div className="ins-body ins-grid">
           {bench === undefined && <p className="ins-help">Loading the latest benchmark...</p>}
           {bench === null && (
             <p className="ins-help">
@@ -305,6 +459,7 @@ export default function Insights(props: {
               <p className="ins-help">
                 {bench.options.requests} helpdesk questions per mode against {bench.target.mock ? "the mock gateway" : "Capella Model Service"} ·{" "}
                 {new Date(bench.startedAt).toLocaleString()}
+                {bench.target.gateway ? ` · gateway ${bench.target.gateway.version}${bench.target.gateway.commitHash ? ` (${bench.target.gateway.commitHash})` : ""}` : ""}
               </p>
               <Bars title="Billed tokens" fmt={(v) => Math.round(v).toLocaleString()} rows={bench.runs.map((r) => ({ mode: r.mode, value: r.summary.billedTokens }))} />
               <Bars title="Average latency" fmt={fmtMs} rows={bench.runs.map((r) => ({ mode: r.mode, value: r.summary.latency.avg }))} />

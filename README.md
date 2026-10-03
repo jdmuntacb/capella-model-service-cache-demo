@@ -26,6 +26,8 @@ Two ways to see it:
    - a running total of tokens saved, $ saved, Bedrock calls avoided and wait time saved
 
    You can switch the cache mode, scope the cache to a conversation, override the similarity threshold, and replay bursts of questions from simulated colleagues across the company.
+
+   Each answer has a **Why? · Trace** link that explains in plain language why it was a hit, a miss or a bypass, and shows the exact request and response (headers and JSON, API key masked) plus **Copy as curl**. The **Traces** tab lists every request in the session, office traffic included.
 2. **`apps/bench`**: a repeatable CLI benchmark. It runs the same seeded helpdesk workload through no cache, standard cache and semantic cache, then writes Markdown, HTML and JSON reports.
 
 | Office traffic | Benchmark view |
@@ -49,7 +51,19 @@ The **mock gateway** (`packages/mock-gateway`) uses the same API and cache heade
 
 ## Run against Capella Model Service
 
-Edit `.env`:
+**From the UI:** open **Gateway insights** and click the connection row (endpoint and model) to open **Connection settings**:
+
+- **Server default** uses `.env`.
+- **Mock gateway** uses the local mock.
+- **Capella Model Service** takes an endpoint URL, API key and model. **Test connection** lists the models the endpoint serves, including any embedding model.
+
+The panel and **Test connection** also read `GET /v1/info`: gateway version, commit and build date, each model's kind and health, and the default cache TTL. `npm run bench` records the same info in `results.json` and in the report header, so each set of numbers says which gateway build produced it.
+
+The **Model** picker at the top of the panel lists every model the endpoint serves, grouped as chat and embedding. With a chat model, messages go to `/v1/chat/completions` through the cache. With an embedding model (for example `amazon.titan-embed-text-v2:0`), each message goes to `POST /v1/embeddings` instead. The reply shows the vector's dimensions, its first values and its cosine similarity to earlier questions in the conversation: the same kind of comparison the semantic cache makes. The gateway does not cache embeddings, so these calls send no `X-cb-cache` header and are left out of the cache savings figures. Use the expand button in the panel header to open **Gateway insights** full screen; press Esc to return.
+
+These preferences are saved in your browser. The API key is kept only for the current tab unless you tick **Remember the API key on this device**. Either way it goes only to this app's own server, which forwards it to the gateway, and it is masked in traces. On a shared deployment, set `DISABLE_UI_CONNECTION=true` so the server never calls a URL supplied by a browser.
+
+**From `.env`** (also used by the CLI benchmark):
 
 ```bash
 USE_MOCK=false
@@ -80,7 +94,7 @@ Each request is an OpenAI-compatible `POST /v1/chat/completions` with `Authoriza
 | `X-cb-cache-expiry-duration: 3600` | Cache entry TTL in seconds |
 | `X-cb-debug: true` | Returns debug headers, including `X-cb-match-score` on hits |
 
-Response: `X-Cache: HIT` on a cache hit. On a miss the header is normally absent. A hit returns the stored response unchanged, including its original `usage`, which is exactly the number of tokens the model did not have to process again.
+Response: `X-Cache: HIT` on a cache hit. On a miss the header is normally absent. With `X-cb-debug: true` the gateway also returns `x-cb-cache-enabled`, `x-cb-cache-type`, `x-cb-cache-expiry`, `x-cb-semantic-cache-match-threshold` and `x-cb-semantic-cache-embedding-model`. The trace explanation uses these. For example, `x-cb-cache-enabled: false` means caching is off for that model or API key. A first-turn question that misses again after an earlier identical request is flagged **repeat missed**: the gateway did not store the earlier answer, so check its logs for cache write errors. A hit returns the stored response unchanged, including its original `usage`, which is exactly the number of tokens the model did not have to process again.
 
 **Standard cache** keys on a SHA-256 of the whole request: messages, model, parameters, system prompt, `X-cb-attr-*` attributes and the calling API key.
 
@@ -140,4 +154,4 @@ It reproduces the behaviour, with paraphrases matching and different intents not
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE). Acme Corp and its employees are fictional.
+Apache-2.0. See [LICENSE](LICENSE). Acme Corp is fictional.

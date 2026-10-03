@@ -270,12 +270,10 @@ export const UNIQUE_QUESTIONS: string[] = [
 ];
 
 export const EMPLOYEES = [
-  { id: "u-priya", name: "Priya Raman", team: "Engineering" },
-  { id: "u-marcus", name: "Marcus Lee", team: "Sales" },
-  { id: "u-sofia", name: "Sofia Alvarez", team: "Marketing" },
-  { id: "u-daniel", name: "Daniel Okafor", team: "Finance" },
-  { id: "u-hana", name: "Hana Sato", team: "Customer Success" },
-  { id: "u-tom", name: "Tom Becker", team: "Engineering" },
+  { id: "u-jagadesh", name: "Jagadesh Munta", team: "Engineering" },
+  { id: "u-mark", name: "Mark Gamble", team: "Marketing" },
+  { id: "u-shrey", name: "Shrey Luthra", team: "Product" },
+  { id: "u-talina", name: "Talina Munta", team: "Engineering" },
 ];
 
 export type QuestionKind = "exact" | "paraphrase" | "unique";

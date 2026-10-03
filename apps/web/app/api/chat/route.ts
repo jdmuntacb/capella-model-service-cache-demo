@@ -1,5 +1,5 @@
 import { CACHE_MODES, GatewayError, SYSTEM_PROMPT, type CacheMode, type ChatMessage } from "@demo/core";
-import { gateway } from "@/lib/server";
+import { ConnectionError, gatewayFor, type ConnectionPrefs } from "@/lib/server";
 
 export const dynamic = "force-dynamic";
 
@@ -8,6 +8,7 @@ interface ChatRequest {
   mode: CacheMode;
   topic?: string;
   threshold?: number;
+  connection?: ConnectionPrefs;
 }
 
 export async function POST(req: Request) {
@@ -27,15 +28,17 @@ export async function POST(req: Request) {
   // The system prompt is fixed server-side: the gateway's cache key includes it.
   const messages: ChatMessage[] = [{ role: "system", content: SYSTEM_PROMPT }, ...turns.slice(-12)];
   try {
-    const result = await gateway().chat(messages, {
+    const result = await gatewayFor(body.connection).chat(messages, {
       mode: body.mode,
       topic: body.topic || undefined,
       threshold: typeof body.threshold === "number" ? body.threshold : undefined,
+      trace: true,
     });
     return Response.json(result);
   } catch (err) {
+    if (err instanceof ConnectionError) return Response.json({ error: err.message }, { status: 400 });
     if (err instanceof GatewayError) {
-      return Response.json({ error: `Gateway returned ${err.status}`, detail: err.body }, { status: 502 });
+      return Response.json({ error: err.message, detail: err.body, trace: err.trace }, { status: 502 });
     }
     const msg = err instanceof Error ? err.message : String(err);
     return Response.json({ error: `Could not reach the gateway: ${msg}` }, { status: 502 });

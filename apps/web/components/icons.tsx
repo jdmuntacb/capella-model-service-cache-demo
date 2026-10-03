@@ -22,6 +22,15 @@ export const IconChat = () => (
 export const IconPlay = () => (
   <svg {...base} width={16} height={16} aria-hidden="true"><path d="M7 5l12 7-12 7z" /></svg>
 );
+export const IconSettings = () => (
+  <svg {...base} width={16} height={16} aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></svg>
+);
+export const IconExpand = () => (
+  <svg {...base} aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" /></svg>
+);
+export const IconShrink = () => (
+  <svg {...base} aria-hidden="true"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7" /></svg>
+);
 
 /** Couchbase logomark (official path, single color via currentColor). */
 export const CouchbaseMark = ({ size = 20 }: { size?: number }) => (

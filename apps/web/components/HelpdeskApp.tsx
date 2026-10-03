@@ -6,11 +6,18 @@ import {
   EMPLOYEES,
   TOPICS,
   buildWorkload,
+  cosineSimilarity,
+  isEmbeddingModel,
   type CacheMode,
   type ChatResult,
+  type EmbedResult,
   type Pricing,
+  type Trace,
 } from "@demo/core";
+import ConnectionDialog, { DEFAULT_CONNECTION, connectionPayload, loadConnection, saveConnection, type Connection } from "./ConnectionDialog";
 import Markdown from "./Markdown";
+import TraceView from "./TraceView";
+import type { EmbeddingInfo } from "./explain";
 import { hitLabel } from "./format";
 import Insights, { type LedgerEntry, type PublicConfig } from "./Insights";
 import { IconChat, IconClose, IconMenu, IconPanel, IconPlus, IconSend } from "./icons";
@@ -23,15 +30,23 @@ interface Meta {
   mode: CacheMode;
   matchScore?: number;
   scoped: boolean;
+  trace?: Trace;
+  repeatMiss?: boolean;
+  /** Set when an embedding model answered (POST /v1/embeddings). */
+  embedding?: EmbeddingInfo & { preview: number[] };
 }
 
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** Sent to an embedding model; left out of the chat history. */
+  embedOnly?: boolean;
   meta?: Meta;
   pending?: boolean;
   error?: string;
+  /** Raw exchange for a failed request. */
+  errorTrace?: Trace;
 }
 
 interface Conversation {
@@ -70,41 +85,128 @@ function save(key: string, value: unknown) {
   }
 }
 
+class ChatFailure extends Error {
+  constructor(
+    message: string,
+    readonly trace?: Trace,
+  ) {
+    super(message);
+  }
+}
+
 async function callChat(
   messages: { role: "user" | "assistant"; content: string }[],
   settings: Settings,
+  connection: Connection,
   topic?: string,
 ): Promise<ChatResult> {
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, mode: settings.mode, topic, threshold: settings.mode === "semantic" ? settings.threshold : undefined }),
+    body: JSON.stringify({
+      messages,
+      mode: settings.mode,
+      topic,
+      threshold: settings.mode === "semantic" ? settings.threshold : undefined,
+      connection: connectionPayload(connection),
+    }),
   });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json.error ?? `Request failed (${res.status})`);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ChatFailure(json.error ?? `Request failed (${res.status})`, json.trace);
   return json as ChatResult;
+}
+
+async function callEmbed(input: string, connection: Connection): Promise<EmbedResult> {
+  const res = await fetch("/api/embed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input, connection: connectionPayload(connection) }),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ChatFailure(json.error ?? `Request failed (${res.status})`, json.trace);
+  return json as EmbedResult;
 }
 
 function fmtMs(ms: number) {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`;
 }
 
-function MessageMeta({ meta, show }: { meta: Meta; show: boolean }) {
+/** What an embedding model returned for one message. */
+function EmbeddingCard({ e }: { e: NonNullable<Meta["embedding"]> }) {
+  const max = Math.max(1e-9, ...e.preview.map(Math.abs));
+  return (
+    <div className="embed-card">
+      <p>
+        <b>{e.dimensions.toLocaleString()}-dimension vector</b> from <code>{e.model}</code>
+      </p>
+      <div className="embed-bars" aria-hidden="true">
+        {e.preview.map((v, i) => (
+          <span key={i} className={v < 0 ? "neg" : ""} style={{ height: `${Math.max(6, (Math.abs(v) / max) * 100)}%` }} />
+        ))}
+      </div>
+      <code className="embed-vec">
+        [{e.preview.map((v) => v.toFixed(4)).join(", ")}
+        {e.dimensions > e.preview.length ? `, ... ${(e.dimensions - e.preview.length).toLocaleString()} more` : ""}]
+      </code>
+      {e.nearest && e.nearest.length > 0 ? (
+        <div className="embed-near">
+          <span className="ins-label">Similarity to earlier questions</span>
+          <ul>
+            {e.nearest.map((n) => (
+              <li key={n.question}>
+                <span className="embed-score">{n.score.toFixed(3)}</span>
+                <span>{n.question}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <p className="embed-hint">Ask a reworded question in this conversation to see its cosine similarity to this one.</p>
+      )}
+    </div>
+  );
+}
+
+function MessageMeta({ meta, show, traceOpen, onTrace }: { meta: Meta; show: boolean; traceOpen: boolean; onTrace: () => void }) {
   if (!show) return null;
   const tokens = meta.promptTokens + meta.completionTokens;
   return (
+    <>
     <div className={`meta ${meta.cacheHit ? "meta-hit" : ""}`}>
-      {meta.cacheHit ? (
+      {meta.embedding ? (
+        <span className="badge badge-miss">Embedding · not cached</span>
+      ) : meta.cacheHit ? (
         <span className={`badge badge-${meta.mode}`}>Cache hit · {hitLabel(meta.mode, meta.matchScore)}</span>
       ) : (
-        <span className="badge badge-miss">{meta.mode === "none" ? "Cache off" : "Cache miss"} · Bedrock</span>
+        <span className="badge badge-miss">
+          {meta.mode === "none" ? "Cache off" : meta.trace?.response?.headers["x-cb-cache-enabled"] === "false" ? "Cache disabled on gateway" : "Cache miss"} · Bedrock
+        </span>
       )}
       <span>{fmtMs(meta.latencyMs)}</span>
       <span>
         {tokens.toLocaleString()} tokens {meta.cacheHit ? "saved" : "billed"}
       </span>
       {meta.scoped && <span>conversation-scoped</span>}
+      {meta.repeatMiss && <span className="badge badge-error">repeat missed</span>}
+      <button className={`trace-toggle ${traceOpen ? "on" : ""}`} onClick={onTrace} aria-expanded={traceOpen}>
+        {traceOpen ? "Hide trace" : "Why? · Trace"}
+      </button>
     </div>
+    {traceOpen && (
+      <TraceView
+        mode={meta.mode}
+        cacheHit={meta.cacheHit}
+        matchScore={meta.matchScore}
+        promptTokens={meta.promptTokens}
+        completionTokens={meta.completionTokens}
+        latencyMs={meta.latencyMs}
+        scoped={meta.scoped}
+        trace={meta.trace}
+        repeatMiss={meta.repeatMiss}
+        embedding={meta.embedding}
+      />
+    )}
+    </>
   );
 }
 
@@ -117,12 +219,27 @@ export default function HelpdeskApp() {
   const [insightsOpen, setInsightsOpen] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
+  // The office simulation loop outlives renders; read the latest ledger through a ref.
+  const ledgerRef = useRef(ledger);
+  ledgerRef.current = ledger;
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [sim, setSim] = useState<{ running: boolean; done: number; total: number }>({ running: false, done: 0, total: 0 });
   const simStop = useRef(false);
   const threadEnd = useRef<HTMLDivElement>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [connection, setConnection] = useState<Connection>(DEFAULT_CONNECTION);
+  const [connOpen, setConnOpen] = useState(false);
+  const [openTraces, setOpenTraces] = useState<Set<string>>(new Set());
+  // Embedding vectors per conversation, kept in memory only (too large for localStorage).
+  const vectors = useRef(new Map<string, { question: string; vector: number[] }[]>());
+  const toggleTrace = (id: string) =>
+    setOpenTraces((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   useEffect(() => {
     fetch("/api/config")
@@ -132,12 +249,14 @@ export default function HelpdeskApp() {
     const stored = load<{ conversations: Conversation[]; employeeId: string; settings: Settings; insightsOpen: boolean } | null>(STORE_KEY, null);
     if (stored) {
       setConversations(stored.conversations.map((c) => ({ ...c, messages: c.messages.filter((m) => !m.pending) })));
-      setEmployeeId(stored.employeeId ?? EMPLOYEES[0].id);
+      // Fall back to the first employee if the saved one is no longer in the list.
+      setEmployeeId(EMPLOYEES.some((e) => e.id === stored.employeeId) ? stored.employeeId : EMPLOYEES[0].id);
       if (stored.settings) setSettings(stored.settings);
       setInsightsOpen(stored.insightsOpen ?? true);
     } else if (window.matchMedia("(max-width: 960px)").matches) {
       setInsightsOpen(false); // on phones the panel overlays the chat; open it on demand
     }
+    setConnection(loadConnection());
     setHydrated(true);
   }, []);
 
@@ -156,7 +275,18 @@ export default function HelpdeskApp() {
     threadEnd.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [active?.messages.length, active?.messages[active?.messages.length - 1]?.pending]);
 
-  const record = useCallback((r: ChatResult, question: string, who: string, source: LedgerEntry["source"]) => {
+  // A first-turn, unscoped request is byte-identical to any earlier first-turn ask of the same question
+  // (the API key is the same for every employee), so missing again means the earlier answer was never stored.
+  // Only count earlier answers that finished at least 300 ms before this request started.
+  const isRepeatMiss = (l: LedgerEntry[], r: ChatResult, question: string, scoped: boolean, firstTurn: boolean) =>
+    !r.cacheHit &&
+    r.mode !== "none" &&
+    !scoped &&
+    firstTurn &&
+    r.trace?.response?.headers["x-cb-cache-enabled"] !== "false" &&
+    l.some((e) => !e.error && e.firstTurn && !e.scoped && e.mode !== "none" && e.question === question && Date.now() - r.latencyMs - e.at > 300);
+
+  const record = useCallback((r: ChatResult, question: string, who: string, source: LedgerEntry["source"], scoped: boolean, firstTurn: boolean, repeatMiss: boolean) => {
     setLedger((l) => [
       ...l,
       {
@@ -171,9 +301,64 @@ export default function HelpdeskApp() {
         latencyMs: r.latencyMs,
         promptTokens: r.usage.prompt_tokens,
         completionTokens: r.usage.completion_tokens,
+        scoped,
+        trace: r.trace,
+        firstTurn,
+        repeatMiss,
       },
     ]);
   }, []);
+
+  const recordEmbedding = useCallback((r: EmbedResult, question: string, who: string) => {
+    setLedger((l) => [
+      ...l,
+      {
+        id: uid(),
+        at: Date.now(),
+        who,
+        question,
+        source: "chat",
+        kind: "embedding",
+        model: r.model,
+        dimensions: r.dimensions,
+        mode: "none",
+        cacheHit: false,
+        latencyMs: r.latencyMs,
+        promptTokens: r.usage.prompt_tokens,
+        completionTokens: 0,
+        scoped: false,
+        trace: r.trace,
+        firstTurn: false,
+      },
+    ]);
+  }, []);
+
+  const recordError = useCallback((err: unknown, question: string, who: string, source: LedgerEntry["source"], mode: CacheMode, scoped: boolean, embedding?: boolean) => {
+    const trace = err instanceof ChatFailure ? err.trace : undefined;
+    setLedger((l) => [
+      ...l,
+      {
+        id: uid(),
+        at: Date.now(),
+        who,
+        question,
+        source,
+        mode,
+        cacheHit: false,
+        latencyMs: trace?.latencyMs ?? 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        scoped,
+        trace,
+        firstTurn: false,
+        kind: embedding ? "embedding" : "chat",
+        error: err instanceof Error ? err.message : String(err),
+      },
+    ]);
+  }, []);
+
+  const effectiveModel = connection.model || config?.model || "the model";
+  const embedModel = isEmbeddingModel(effectiveModel);
 
   const patchConversation = (id: string, fn: (c: Conversation) => Conversation) =>
     setConversations((cs) => cs.map((c) => (c.id === id ? fn(c) : c)));
@@ -192,14 +377,57 @@ export default function HelpdeskApp() {
       setActiveId(created.id);
     }
     const convId = conv.id;
-    const userMsg: Message = { id: uid(), role: "user", content: question };
+    const embedMode = isEmbeddingModel(effectiveModel);
+    const userMsg: Message = { id: uid(), role: "user", content: question, embedOnly: embedMode || undefined };
     const pending: Message = { id: uid(), role: "assistant", content: "", pending: true };
-    const history = [...conv.messages.filter((m) => !m.error && !m.pending), userMsg].map((m) => ({ role: m.role, content: m.content }));
+    // Embedding turns are not part of the chat conversation.
+    const history = [...conv.messages.filter((m) => !m.error && !m.pending && !m.embedOnly && !m.meta?.embedding), userMsg].map((m) => ({ role: m.role, content: m.content }));
     // Functional updates run in order, so a conversation created above is already present here.
     patchConversation(convId, (c) => ({ ...c, messages: [...c.messages, userMsg, pending] }));
 
+    if (embedMode) {
+      try {
+        const r = await callEmbed(question, connection);
+        const earlier = vectors.current.get(convId) ?? [];
+        const nearest = earlier
+          .filter((v) => v.question !== question && v.vector.length === r.embedding.length)
+          .map((v) => ({ question: v.question, score: cosineSimilarity(r.embedding, v.vector) }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 3);
+        vectors.current.set(convId, [...earlier.filter((v) => v.question !== question), { question, vector: r.embedding }]);
+        const meta: Meta = {
+          cacheHit: false,
+          latencyMs: r.latencyMs,
+          promptTokens: r.usage.prompt_tokens,
+          completionTokens: 0,
+          mode: "none",
+          scoped: false,
+          trace: r.trace,
+          embedding: { model: r.model, dimensions: r.dimensions, nearest, preview: r.embedding.slice(0, 8) },
+        };
+        patchConversation(convId, (c) => ({
+          ...c,
+          messages: c.messages.map((m) => (m.id === pending.id ? { ...m, pending: false, meta } : m)),
+        }));
+        recordEmbedding(r, question, employee.name);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const errorTrace = err instanceof ChatFailure ? err.trace : undefined;
+        patchConversation(convId, (c) => ({
+          ...c,
+          messages: c.messages.map((m) => (m.id === pending.id ? { ...m, pending: false, error: msg, errorTrace, embedOnly: true } : m)),
+        }));
+        recordError(err, question, employee.name, "chat", "none", false, true);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
     try {
-      const r = await callChat(history, settings, settings.scoped ? convId : undefined);
+      const r = await callChat(history, settings, connection, settings.scoped ? convId : undefined);
+      const firstTurn = history.length === 1;
+      const repeatMiss = isRepeatMiss(ledgerRef.current, r, question, settings.scoped, firstTurn);
       const meta: Meta = {
         cacheHit: r.cacheHit,
         latencyMs: r.latencyMs,
@@ -208,25 +436,29 @@ export default function HelpdeskApp() {
         mode: r.mode,
         matchScore: r.matchScore,
         scoped: settings.scoped,
+        trace: r.trace,
+        repeatMiss,
       };
       patchConversation(convId, (c) => ({
         ...c,
         messages: c.messages.map((m) => (m.id === pending.id ? { ...m, content: r.content, pending: false, meta } : m)),
       }));
-      record(r, question, employee.name, "chat");
+      record(r, question, employee.name, "chat", settings.scoped, firstTurn, repeatMiss);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      const errorTrace = err instanceof ChatFailure ? err.trace : undefined;
       patchConversation(convId, (c) => ({
         ...c,
-        messages: c.messages.map((m) => (m.id === pending.id ? { ...m, pending: false, error: msg } : m)),
+        messages: c.messages.map((m) => (m.id === pending.id ? { ...m, pending: false, error: msg, errorTrace } : m)),
       }));
+      recordError(err, question, employee.name, "chat", settings.mode, settings.scoped);
     } finally {
       setBusy(false);
     }
   }
 
   async function simulateOffice(requests: number) {
-    if (sim.running) return;
+    if (sim.running || embedModel) return;
     simStop.current = false;
     const workload = buildWorkload({ requests, seed: Math.floor(Math.random() * 1e9) });
     setSim({ running: true, done: 0, total: workload.length });
@@ -235,10 +467,10 @@ export default function HelpdeskApp() {
       const who = EMPLOYEES.find((e) => e.id === item.employeeId)?.name ?? item.employeeId;
       try {
         // Each colleague asks in their own fresh conversation.
-        const r = await callChat([{ role: "user", content: item.question }], settings, settings.scoped ? `sim-${uid()}` : undefined);
-        record(r, item.question, who, "office");
-      } catch {
-        // keep going; errors show up as a gap in the feed
+        const r = await callChat([{ role: "user", content: item.question }], settings, connection, settings.scoped ? `sim-${uid()}` : undefined);
+        record(r, item.question, who, "office", settings.scoped, true, isRepeatMiss(ledgerRef.current, r, item.question, settings.scoped, true));
+      } catch (err) {
+        recordError(err, item.question, who, "office", settings.mode, settings.scoped);
       }
       setSim((s) => ({ ...s, done: s.done + 1 }));
     }
@@ -316,9 +548,15 @@ export default function HelpdeskApp() {
             <h1>{active ? active.title : "New request"}</h1>
             <span className="status-dot">IT &amp; HR assistant · online</span>
           </div>
-          <span className={`mode-pill mode-${settings.mode}`} title="Gateway cache mode for new messages">
-            {MODE_LABEL[settings.mode]} cache{settings.scoped ? " · scoped" : ""}
-          </span>
+          {embedModel ? (
+            <span className="mode-pill mode-none" title="An embedding model is selected: messages go to /v1/embeddings">
+              Embeddings
+            </span>
+          ) : (
+            <span className={`mode-pill mode-${settings.mode}`} title="Gateway cache mode for new messages">
+              {MODE_LABEL[settings.mode]} cache{settings.scoped ? " · scoped" : ""}
+            </span>
+          )}
           <button
             className={`btn btn-ghost ${insightsOpen ? "pressed" : ""}`}
             onClick={() => setInsightsOpen((o) => !o)}
@@ -360,13 +598,31 @@ export default function HelpdeskApp() {
                       </span>
                     ) : m.error ? (
                       <p>Sorry, the assistant could not answer: {m.error}</p>
+                    ) : m.meta?.embedding ? (
+                      <EmbeddingCard e={m.meta.embedding} />
                     ) : m.role === "assistant" ? (
                       <Markdown text={m.content} />
                     ) : (
                       <p>{m.content}</p>
                     )}
                   </div>
-                  {m.meta && <MessageMeta meta={m.meta} show={insightsOpen} />}
+                  {m.meta && <MessageMeta meta={m.meta} show={insightsOpen} traceOpen={openTraces.has(m.id)} onTrace={() => toggleTrace(m.id)} />}
+                  {m.error && (
+                    <>
+                      <div className="meta">
+                        <span className="badge badge-error">Request failed</span>
+                        <button className={`trace-toggle ${openTraces.has(m.id) ? "on" : ""}`} onClick={() => toggleTrace(m.id)} aria-expanded={openTraces.has(m.id)}>
+                          {openTraces.has(m.id) ? "Hide trace" : "Why? · Trace"}
+                        </button>
+                      </div>
+                      {openTraces.has(m.id) && (
+                        <TraceView
+                          embedding={m.embedOnly ? { model: effectiveModel, dimensions: 0 } : undefined}
+                          mode={settings.mode}
+                          cacheHit={false} promptTokens={0} completionTokens={0} latencyMs={m.errorTrace?.latencyMs ?? 0} scoped={false} trace={m.errorTrace} error={m.error} />
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
             ))
@@ -390,7 +646,7 @@ export default function HelpdeskApp() {
                 send(draft);
               }
             }}
-            placeholder="Describe what you need help with..."
+            placeholder={embedModel ? "Type text to embed with " + effectiveModel + "..." : "Describe what you need help with..."}
             rows={1}
             aria-label="Message"
           />
@@ -398,7 +654,11 @@ export default function HelpdeskApp() {
             <IconSend />
           </button>
         </form>
-        <p className="disclaimer">Answers come from Claude Sonnet via Capella Model Service. Never share passwords or one-time codes.</p>
+        <p className="disclaimer">
+          {embedModel
+            ? `Embedding model selected: messages are sent to /v1/embeddings on ${effectiveModel}. Pick a chat model in Gateway insights to chat.`
+            : `Answers come from ${effectiveModel} via Capella Model Service. Never share passwords or one-time codes.`}
+        </p>
       </main>
 
       {insightsOpen && (
@@ -413,6 +673,28 @@ export default function HelpdeskApp() {
           onSimulate={simulateOffice}
           onStopSim={() => (simStop.current = true)}
           onClose={() => setInsightsOpen(false)}
+          connection={connection}
+          model={effectiveModel}
+          onModel={(model) => {
+            const c = { ...connection, model };
+            setConnection(c);
+            saveConnection(c);
+          }}
+          onOpenConnection={() => setConnOpen(true)}
+        />
+      )}
+      {connOpen && (
+        <ConnectionDialog
+          value={connection}
+          config={config}
+          onClose={() => setConnOpen(false)}
+          onSave={(c) => {
+            // Session totals from one gateway mean nothing for another.
+            if (JSON.stringify(connectionPayload(c)) !== JSON.stringify(connectionPayload(connection))) setLedger([]);
+            setConnection(c);
+            saveConnection(c);
+            setConnOpen(false);
+          }}
         />
       )}
     </div>
